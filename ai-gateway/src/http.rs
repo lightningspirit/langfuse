@@ -121,14 +121,25 @@ async fn relay(
         .filter(|_| state.lifecycle.is_ready())
         .ok_or(InferenceHttpError::Unavailable)?;
     let gateway_key = gateway_key(request.headers(), route.api_format())?.to_owned();
-    if route.method() != axum::http::Method::GET
-        && !crate::transport::identity_encoding(request.headers())
-    {
+    // Model extraction and upstream rewriting require an uncompressed JSON body.
+    if route.requires_model_rewrite() && !crate::transport::identity_encoding(request.headers()) {
         return Err(InferenceHttpError::UnsupportedEncoding);
     }
     let resolution_permit = inference
         .try_reserve_resolution()
         .map_err(InferenceHttpError::from)?;
+    if route.uses_control_plane_models() {
+        let body = inference
+            .models(
+                resolution_permit,
+                &gateway_key,
+                route.api_format(),
+                correlation,
+            )
+            .await
+            .map_err(InferenceHttpError::Resolution)?;
+        return Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response());
+    }
     let query = forwarded_query(route, request.uri().query());
     let (parts, body) = request.into_parts();
     let (bytes, model) = request_body_and_model(route, body).await?;
@@ -165,7 +176,7 @@ async fn request_body_and_model(
     route: Route,
     body: Body,
 ) -> Result<(Bytes, Option<String>), InferenceHttpError> {
-    if route.method() == axum::http::Method::GET {
+    if !route.requires_model_rewrite() {
         return Ok((Bytes::new(), None));
     }
     let bytes = read_request_body(body).await?;

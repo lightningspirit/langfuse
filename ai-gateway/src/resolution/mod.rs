@@ -7,10 +7,10 @@ pub use contracts::{
     ProviderCredential, RequestAttribution, ResolvedRequestContext,
 };
 use reqwest::{
-    Client, Url,
+    Client, Method, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue},
 };
-use reqwest_middleware::ClientWithMiddleware;
+use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use std::{
     fmt,
     net::IpAddr,
@@ -18,6 +18,7 @@ use std::{
 };
 
 const RESOLVE_PATH: &str = "/api/internal/ai-gateway/v1/resolve";
+const MODELS_PATH: &str = "/api/internal/ai-gateway/v1/models";
 const REQUEST_ID_HEADER: &str = "langfuse-gateway-request-id";
 const ERROR_CODE_HEADER: &str = "langfuse-gateway-error-code";
 // Web sits behind load balancers that drop idle connections after 60s by default
@@ -136,6 +137,33 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Fetch the caller-visible model catalog from trusted Web.
+    ///
+    /// # Errors
+    /// Returns the same sanitized errors as [`Self::resolve`].
+    pub async fn models(
+        &self,
+        gateway_key: &str,
+        api_format: ApiFormat,
+        request_id: &str,
+    ) -> Result<Vec<u8>, ResolutionError> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ResolutionError::Unavailable)?;
+        let mut endpoint = self.config.endpoint(MODELS_PATH);
+        endpoint
+            .query_pairs_mut()
+            .append_pair("api_format", api_format.as_str());
+        let request = self.authenticated_request(
+            Method::GET,
+            endpoint,
+            gateway_key,
+            timestamp.as_secs(),
+            request_id,
+        )?;
+        self.execute(request).await
+    }
+
     async fn resolve_at(
         &self,
         gateway_key: &str,
@@ -144,22 +172,26 @@ impl ControlPlaneClient {
         timestamp: Duration,
         request_id: &str,
     ) -> Result<ResolvedRequestContext, ResolutionError> {
-        if gateway_key.len() > 8192 || !valid_token(gateway_key) {
-            return Err(ResolutionError::InvalidCredential);
-        }
         let started = Instant::now();
-        let body = tokio::time::timeout(
-            self.config.limits.timeout,
-            self.fetch(
+        let body = match model {
+            Some(model) => serde_json::to_vec(&serde_json::json!({
+                "apiFormat": api_format,
+                "model": model,
+            })),
+            None => serde_json::to_vec(&serde_json::json!({ "apiFormat": api_format })),
+        }
+        .map_err(|_| ResolutionError::Configuration)?;
+        let request = self
+            .authenticated_request(
+                Method::POST,
+                self.config.endpoint(RESOLVE_PATH),
                 gateway_key,
-                api_format,
-                model,
                 timestamp.as_secs(),
                 request_id,
-            ),
-        )
-        .await
-        .map_err(|_| ResolutionError::Timeout)??;
+            )?
+            .header(CONTENT_TYPE, "application/json")
+            .body(body);
+        let body = self.execute(request).await?;
         contracts::decode(
             &body,
             api_format,
@@ -167,14 +199,17 @@ impl ControlPlaneClient {
         )
     }
 
-    async fn fetch(
+    fn authenticated_request(
         &self,
+        method: Method,
+        endpoint: Url,
         gateway_key: &str,
-        api_format: ApiFormat,
-        model: Option<&str>,
         timestamp: u64,
         request_id: &str,
-    ) -> Result<Vec<u8>, ResolutionError> {
+    ) -> Result<RequestBuilder, ResolutionError> {
+        if gateway_key.len() > 8192 || !valid_token(gateway_key) {
+            return Err(ResolutionError::InvalidCredential);
+        }
         let mut credential = HeaderValue::from_str(&format!("Bearer {gateway_key}"))
             .map_err(|_| ResolutionError::InvalidCredential)?;
         credential.set_sensitive(true);
@@ -185,61 +220,65 @@ impl ControlPlaneClient {
         ))
         .map_err(|_| ResolutionError::Configuration)?;
         signature.set_sensitive(true);
-        let body = match model {
-            Some(model) => serde_json::to_vec(&serde_json::json!({
-                "apiFormat": api_format,
-                "model": model,
-            })),
-            None => serde_json::to_vec(&serde_json::json!({ "apiFormat": api_format })),
-        }
-        .map_err(|_| ResolutionError::Configuration)?;
-        let mut response = self
+        Ok(self
             .client
-            .post(self.config.endpoint(RESOLVE_PATH))
+            .request(method, endpoint)
             .header(AUTHORIZATION, credential)
             .header("langfuse-gateway-authorization", signature)
-            .header(REQUEST_ID_HEADER, request_id)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| ResolutionError::Transport)?;
-        match response.status().as_u16() {
-            200 => {}
-            400 => return Err(ResolutionError::InvalidRequest),
-            401 => return Err(ResolutionError::Authentication),
-            403 if response
-                .headers()
-                .get(ERROR_CODE_HEADER)
-                .is_some_and(|value| value == "model_not_allowed") =>
-            {
-                return Err(ResolutionError::ModelNotAllowed);
-            }
-            403 => return Err(ResolutionError::Forbidden),
-            404 => return Err(ResolutionError::NoRoute),
-            429 | 500..=599 => return Err(ResolutionError::Unavailable),
-            _ => return Err(ResolutionError::InvalidResponse),
-        }
-        let limit = self.config.limits.max_response_bytes;
-        if response
-            .content_length()
-            .is_some_and(|size| size > limit as u64)
+            .header(REQUEST_ID_HEADER, request_id))
+    }
+
+    async fn execute(&self, request: RequestBuilder) -> Result<Vec<u8>, ResolutionError> {
+        tokio::time::timeout(self.config.limits.timeout, async {
+            let response = request
+                .send()
+                .await
+                .map_err(|_| ResolutionError::Transport)?;
+            read_response(response, self.config.limits.max_response_bytes).await
+        })
+        .await
+        .map_err(|_| ResolutionError::Timeout)?
+    }
+}
+
+async fn read_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ResolutionError> {
+    match response.status().as_u16() {
+        200 => {}
+        400 => return Err(ResolutionError::InvalidRequest),
+        401 => return Err(ResolutionError::Authentication),
+        403 if response
+            .headers()
+            .get(ERROR_CODE_HEADER)
+            .is_some_and(|value| value == "model_not_allowed") =>
         {
+            return Err(ResolutionError::ModelNotAllowed);
+        }
+        403 => return Err(ResolutionError::Forbidden),
+        404 => return Err(ResolutionError::NoRoute),
+        429 | 500..=599 => return Err(ResolutionError::Unavailable),
+        _ => return Err(ResolutionError::InvalidResponse),
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(ResolutionError::ResponseTooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ResolutionError::Transport)?
+    {
+        if chunk.len() > limit - bytes.len() {
             return Err(ResolutionError::ResponseTooLarge);
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| ResolutionError::Transport)?
-        {
-            if chunk.len() > limit - bytes.len() {
-                return Err(ResolutionError::ResponseTooLarge);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        bytes.extend_from_slice(&chunk);
     }
+    Ok(bytes)
 }
 
 fn valid_token(value: &str) -> bool {

@@ -63,6 +63,21 @@ impl Route {
         }
     }
 
+    pub(crate) fn requires_model_rewrite(self) -> bool {
+        matches!(
+            self,
+            Self::OpenAiResponses
+                | Self::OpenAiResponsesCompact
+                | Self::OpenAiChatCompletions
+                | Self::AnthropicMessages
+                | Self::AnthropicCountTokens
+        )
+    }
+
+    pub(crate) fn uses_control_plane_models(self) -> bool {
+        matches!(self, Self::OpenAiModels | Self::AnthropicModels)
+    }
+
     fn path(self) -> &'static str {
         match self {
             Self::OpenAiResponses => "/responses",
@@ -227,10 +242,10 @@ impl ProviderTransport {
             ExecutionCapture::unobserved()
         };
         let provider_model = context.connection().provider_model();
-        let body = if route.method() == Method::GET {
-            body
-        } else {
+        let body = if route.requires_model_rewrite() {
             rewrite_model(body, provider_model.ok_or(ProviderError::Configuration)?)
+        } else {
+            body
         };
         // The capture keeps the caller's own request; only the upstream copy asks for usage.
         let body = match route {
@@ -250,7 +265,7 @@ impl ProviderTransport {
             .headers(transport::request_headers(headers, api_format))
             .header(header::ACCEPT_ENCODING, "identity")
             .header(credential_name, credential);
-        if route.method() != Method::GET {
+        if route.requires_model_rewrite() {
             upstream = upstream.body(body);
         }
         let response = tokio::time::timeout_at(
@@ -325,10 +340,17 @@ struct ModelMember<'a> {
 
 fn rewrite_model(body: Bytes, provider_model: &str) -> Bytes {
     let (start, end) = {
+        // Borrow the raw top-level value so its slice still points into `body`.
+        // Re-serializing the full request can reorder nested schema properties and
+        // normalize otherwise untouched caller JSON.
         let Ok(request) = serde_json::from_slice::<ModelMember<'_>>(&body) else {
+            // The HTTP layer validates `model` before forwarding. Preserve the
+            // original bytes if this helper still receives an unexpected body.
             return body;
         };
         let model = request.model.get();
+        // Convert the borrowed value's position into indexes for a surgical
+        // replacement, with bounds checks before slicing the original body.
         let Some(start) = (model.as_ptr() as usize).checked_sub(body.as_ptr() as usize) else {
             return body;
         };
